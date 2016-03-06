@@ -1,0 +1,13 @@
+[Unit]
+Description=transmission-daemon
+After=syslog.target network.target
+
+[Service]
+PIDFile=/run/transmission-daemon.pid
+User=root
+StandardError=syslog
+ExecStart=/usr/local/bin/transmission-daemon -f --blocklist -g /etc/transmission-daemon/
+ExecReload=/bin/kill -s HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target
