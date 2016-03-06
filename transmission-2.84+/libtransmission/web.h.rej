@@ -1,0 +1,14 @@
+--- libtransmission/web.h	2015-02-14 11:26:46.000000000 -0700
++++ libtransmission/web.h	2015-04-04 12:39:26.000000000 -0600
+@@ -37,7 +38,11 @@
+ 
+ void tr_webClose (tr_session * session, tr_web_close_mode close_mode);
+ 
++bool task_addr_is_blocklisted (struct tr_web_task * task);
++
+ typedef void (*tr_web_done_func)(tr_session       * session,
++				 char		  * task_addr,
++				 bool		    aborted,
+                                  bool               timeout_flag,
+                                  bool               did_connect_flag,
+                                  long               response_code,

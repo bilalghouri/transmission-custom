@@ -1,0 +1,5 @@
+cencode.o: cencode.c /usr/include/stdc-predef.h b64/cencode.h
+
+/usr/include/stdc-predef.h:
+
+b64/cencode.h:

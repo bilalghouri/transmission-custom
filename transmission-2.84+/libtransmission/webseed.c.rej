@@ -1,0 +1,92 @@
+--- libtransmission/webseed.c	2015-02-14 11:37:31.000000000 -0700
++++ libtransmission/webseed.c	2015-04-04 23:22:37.000000000 -0600
+@@ -170,15 +179,19 @@
+       const uint32_t offset_end = data->block_offset + len;
+       tr_cache * cache = data->session->cache;
+       const tr_piece_index_t piece = data->piece_index;
+-
+-      while (len > 0)
+-        {
+-          const uint32_t bytes_this_pass = MIN (len, block_size);
+-          tr_cacheWriteBlock (cache, tor, piece, offset_end - len, bytes_this_pass, buf);
+-          len -= bytes_this_pass;
+-        }
+-
+-      fire_client_got_blocks (tor, w, data->block_index, data->count);
++      
++      if (!tr_torrentPieceIsComplete (tor, piece))
++	{
++	  while (len > 0)
++	    {
++	      const uint32_t bytes_this_pass = MIN (len, block_size);
++	      tr_cacheWriteBlock (cache, tor, piece, offset_end - len, bytes_this_pass, buf);
++	      len -= bytes_this_pass;
++	    }
++	    
++	  tr_bitfieldAdd (&w->blame, piece);
++	  fire_client_got_blocks (tor, w, data->block_index, data->count);
++	}
+     }
+ 
+   evbuffer_free (buf);
+@@ -512,32 +608,53 @@
+               t->response_code = 0;
+               task_request_next_chunk (t);
+             }
+-            else
++	  else
+             {
+-              if (buf_len)
++              if (buf_len && !tr_torrentPieceIsComplete (tor, t->piece_index))
+                 {
+                   /* on_content_changed () will not write a block if it is smaller than
+                      the torrent's block size, i.e. the torrent's very last block */
+                   tr_cacheWriteBlock (session->cache, tor,
+                                       t->piece_index, t->piece_offset + bytes_done,
+                                       buf_len, t->content);
+-
++		  tr_bitfieldAdd (&w->blame, t->piece_index);
+                   fire_client_got_blocks (tor, t->webseed,
+                                           t->block + t->blocks_done, 1);
+                 }
+ 
+-              ++w->idle_connections;
+-
+               tr_list_remove_data (&w->tasks, t);
+               evbuffer_free (t->content);
+               tr_free (t);
+-
+-              on_idle (w);
++	      
++	      ++w->idle_connections;	      
++	      
++	      on_idle (w);
+             }
+         }
+     }
+ }
+ 
++void
++tr_webseed_add_strike (tr_webseed	  * w,
++				tr_torrent	  * tor,
++				tr_piece_index_t    pieceIndex)
++{
++  if (tr_bitfieldHas (&w->blame, pieceIndex))
++    {
++      ++w->strike_count;
++      
++      if (w->strike_count < MAX_BAD_PIECES_PER_WEBSEED)
++	tr_logAddTorDbg (tor, "Webseed IP:%s URL:%s contributed to corrupt piece %d, strike_count is %d.", 
++				w->addr, w->base_url, pieceIndex, w->strike_count);
++      else
++	{
++	  w->is_blocklisted = true;
++	  tr_logAddTorInfo (tor, "Webseed IP:%s URL:%s has sent %d bad pieces and has been disabled.", 
++				  w->addr, w->base_url, MAX_BAD_PIECES_PER_WEBSEED);
++	}
++    }
++}
++
+ static struct evbuffer *
+ make_url (tr_webseed * w, const tr_file * file)
+ {

@@ -1,0 +1,942 @@
+--- /libtransmission/announcer-http.c	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/announcer-http.c	2015-03-17 13:24:56.000000000 -0600
+@@ -184,6 +184,8 @@
+ 
+ static void
+ on_announce_done (tr_session   * session,
++		  char	       * task_addr UNUSED,
++		  bool		 aborted UNUSED,
+                   bool           did_connect,
+                   bool           did_timeout,
+                   long           response_code,
+@@ -334,6 +336,8 @@
+ 
+ static void
+ on_scrape_done (tr_session   * session,
++		char	     * task_addr UNUSED,
++		bool	       aborted UNUSED,
+                 bool           did_connect,
+                 bool           did_timeout,
+                 long           response_code,
+--- /libtransmission/peer-mgr.c	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/peer-mgr.c	2015-04-04 23:38:14.000000000 -0600
+@@ -75,6 +75,9 @@
+   /* number of bad pieces a peer is allowed to send before we ban them */
+   MAX_BAD_PIECES_PER_PEER = 5,
+ 
++  /* since webseeds are not fully integrated with max connected peers... */
++  MAX_WEBSEEDS_PER_SWARM = 16,
++  
+   /* amount of time to keep a list of request pieces lying around
+      before it's considered too old and needs to be rebuilt */
+   PIECE_LIST_SHELF_LIFE_SECS = 60,
+@@ -189,6 +192,7 @@
+   tr_ptrArray                pool; /* struct peer_atom */
+   tr_ptrArray                peers; /* tr_peerMsgs */
+   tr_ptrArray                webseeds; /* tr_webseed */
++  bool			     poke_webseeds;
+ 
+   tr_torrent               * tor;
+   struct tr_peerMgr        * manager;
+@@ -522,13 +526,17 @@
+   tr_ptrArrayDestruct (&s->webseeds, (PtrArrayForeachFunc)tr_peerFree);
+   s->webseeds = TR_PTR_ARRAY_INIT;
+   s->stats.activeWebseedCount = 0;
++  tor->info.next_webseed_i = 0;
+ 
+   /* repopulate it */
+-  for (i=0; i<inf->webseedCount; ++i)
++  for (i=0; i<MIN (inf->webseedCount, MAX_WEBSEEDS_PER_SWARM); ++i)
+     {
+       tr_webseed * w = tr_webseedNew (tor, inf->webseeds[i], peerCallbackFunc, s);
+       tr_ptrArrayAppend (&s->webseeds, w);
+     }
++    
++  tor->info.next_webseed_i = tr_ptrArraySize (&s->webseeds);
++  s->poke_webseeds = false;
+ }
+ 
+ static tr_swarm *
+@@ -853,7 +861,7 @@
+     }
+ }
+ 
+-static int
++int
+ countActiveWebseeds (tr_swarm * s)
+ {
+   int activeCount = 0;
+@@ -1892,7 +1900,12 @@
+ static int
+ getMaxPeerCount (const tr_torrent * tor)
+ {
+-  return tor->maxConnectedPeers;
++  int max_peers = tor->maxConnectedPeers - countActiveWebseeds (tor->swarm)*4;
++  
++  if (max_peers < 0)
++    max_peers = 0;
++   
++  return max_peers;
+ }
+ 
+ static int
+@@ -2223,11 +2236,16 @@
+           tordbg (s, "peer %s contributed to corrupt piece (%d); now has %d strikes",
+                   tr_atomAddrStr(peer->atom), pieceIndex, (int)peer->strikes + 1);
+           addStrike (s, peer);
++	  tr_announcerAddBytes (tor, TR_ANN_CORRUPT, byteCount);
+         }
+     }
+-
+-
+-  tr_announcerAddBytes (tor, TR_ANN_CORRUPT, byteCount);
++    
++  for (i=0, n=tr_ptrArraySize(&s->webseeds); i!=n; ++i)
++    {
++      tr_webseed * w = tr_ptrArrayNth (&s->webseeds, i);
++      /* the webseed's blame bitfield will be checked first... */
++      tr_webseed_add_strike (w, tor, pieceIndex);
++    }
+ }
+ 
+ int
+@@ -2397,6 +2415,57 @@
+     m->refillUpkeepTimer = createTimer (m->session, REFILL_UPKEEP_PERIOD_MSEC, refillUpkeep, m);
+ }
+ 
++static void
++poke_webseed_array (tr_swarm * s, tr_torrent * tor)
++{
++  if (!s->poke_webseeds)
++    {
++      s->poke_webseeds = true;
++      return;
++    }
++    
++  int i;
++  const int n = tr_ptrArraySize(&s->webseeds);
++  int blocked_webseeds = 0;
++  int webseeds_poked = 0;
++  const tr_info * inf = &tor->info;
++
++  for (i = 0; i < n; ++i)
++    {
++      tr_webseed * w = tr_ptrArrayNth (&s->webseeds, i);
++      if (tr_webseed_is_blocklisted (w))
++	++blocked_webseeds;
++    }
++    
++  if (blocked_webseeds && inf->webseedCount > MAX_WEBSEEDS_PER_SWARM)
++    {
++      for (i = 0; i < n && blocked_webseeds && inf->next_webseed_i < inf->webseedCount; ++i)
++	{
++	  tr_webseed * w = tr_ptrArrayNth (&s->webseeds, i);
++	  if (tr_webseed_is_blocklisted (w))
++	    {
++	      tr_ptrArrayRemove (&s->webseeds, i);
++	      if (i < n - 1)
++		--i;
++	      tr_webseed * w = tr_webseedNew (tor, inf->webseeds[tor->info.next_webseed_i++], peerCallbackFunc, s);
++	      tr_ptrArrayAppend (&s->webseeds, w);
++	      ++webseeds_poked;
++	      --blocked_webseeds;
++	    }
++	}
++    }
++  
++  if (!webseeds_poked && blocked_webseeds == n)
++    {
++      bool was_running = tor->isStopping;
++      tr_torrentSetLocalError (tor, "All webseeds are either in a blocklist, or have sent unusable data. "
++				    "See log file, or to query them again, re-add the torrent.");
++      tor->isStopping = was_running;
++    }
++    
++  s->stats.activeWebseedCount = 0;
++}
++
+ void
+ tr_peerMgrStartTorrent (tr_torrent * tor)
+ {
+@@ -2411,7 +2480,10 @@
+   s->isRunning = true;
+   s->maxPeers = tor->maxConnectedPeers;
+   s->pieceSortState = PIECES_UNSORTED;
+-
++  
++  if (tr_torrentHasMetadata (tor) && tor->info.next_webseed_i > 0)
++    poke_webseed_array (s, tor);
++    
+   rechokePulse (0, 0, s->manager);
+ }
+ 
+@@ -3460,7 +3532,12 @@
+ enforceTorrentPeerLimit (tr_swarm * s, uint64_t now)
+ {
+   int n = tr_ptrArraySize (&s->peers);
+-  const int max = tr_torrentGetPeerLimit (s->tor);
++  /* webseeds normally generate 4 connections each */
++  int max = (tr_torrentGetPeerLimit (s->tor) - countActiveWebseeds (s)*4);
++  
++  if (max < 0)
++    max = 0;
++    
+   if (n > max)
+     {
+       void * base = tr_ptrArrayBase (&s->peers);
+@@ -3476,12 +3553,19 @@
+ enforceSessionPeerLimit (tr_session * session, uint64_t now)
+ {
+   int n = 0;
++  int ws = 0;
+   tr_torrent * tor = NULL;
+-  const int max = tr_sessionGetPeerLimit (session);
+-
++  int max = tr_sessionGetPeerLimit (session);
+   /* count the total number of peers */
+   while ((tor = tr_torrentNext (session, tor)))
+-    n += tr_ptrArraySize (&tor->swarm->peers);
++    {
++      n += tr_ptrArraySize (&tor->swarm->peers);
++      ws += countActiveWebseeds (tor->swarm)*4;
++    }
++    
++  max -= ws;
++  if (max < 0)
++    max = 0;
+ 
+   /* if there are too many, prune out the worst */
+   if (n > max)
+@@ -3932,14 +4016,13 @@
+ {
+   int atomCount;
+   int peerCount;
++  int webseedCount = 0;
+   tr_torrent * tor;
+   struct peer_candidate * candidates;
+   struct peer_candidate * walk;
+   const time_t now = tr_time ();
+   const uint64_t now_msec = tr_time_msec ();
+-  /* leave 5% of connection slots for incoming connections -- ticket #2609 */
+-  const int maxCandidates = tr_sessionGetPeerLimit (session) * 0.95;
+-
++  
+   /* count how many peers and atoms we've got */
+   tor= NULL;
+   atomCount = 0;
+@@ -3948,8 +4031,10 @@
+     {
+       atomCount += tr_ptrArraySize (&tor->swarm->pool);
+       peerCount += tr_ptrArraySize (&tor->swarm->peers);
++      webseedCount += countActiveWebseeds (tor->swarm)*4;
+     }
+-
++  /* leave 5% of connection slots for incoming connections -- ticket #2609 */
++  const int maxCandidates = (tr_sessionGetPeerLimit (session) * 0.95 - webseedCount);
+   /* don't start any new handshakes if we're full up */
+   if (maxCandidates <= peerCount)
+     {
+@@ -3971,7 +4056,7 @@
+         continue;
+ 
+       /* if we've already got enough peers in this torrent... */
+-      if (tr_torrentGetPeerLimit (tor) <= tr_ptrArraySize (&tor->swarm->peers))
++      if ((tr_torrentGetPeerLimit (tor) - countActiveWebseeds (tor->swarm)*4) <= tr_ptrArraySize (&tor->swarm->peers))
+         continue;
+ 
+       /* if we've already got enough speed in this torrent... */
+--- /libtransmission/peer-mgr.h	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/peer-mgr.h	2015-03-24 14:41:43.000000000 -0600
+@@ -90,6 +90,8 @@
+ void         tr_peerMgrSetUtpFailed         (tr_torrent          * tor,
+                                              const tr_address    * addr,
+                                              bool                  failed);
++					     
++int	     countActiveWebseeds	    (struct tr_swarm	 * swarm);
+ 
+ void         tr_peerMgrGetNextRequests      (tr_torrent          * torrent,
+                                              tr_peer             * peer,
+--- /libtransmission/rpcimpl.c	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/rpcimpl.c	2015-03-21 15:43:52.000000000 -0600
+@@ -1426,6 +1426,8 @@
+ 
+ static void
+ portTested (tr_session       * session UNUSED,
++	    char	     * task_addr UNUSED,
++	    bool	       aborted UNUSED,
+             bool               did_connect UNUSED,
+             bool               did_timeout UNUSED,
+             long               response_code,
+@@ -1470,6 +1472,8 @@
+ 
+ static void
+ gotNewBlocklist (tr_session       * session,
++		 char		  * task_addr UNUSED,
++		 bool		    aborted UNUSED,
+                  bool               did_connect UNUSED,
+                  bool               did_timeout UNUSED,
+                  long               response_code,
+@@ -1642,6 +1646,8 @@
+ 
+ static void
+ gotMetadataFromURL (tr_session       * session UNUSED,
++		    char	     * task_addr UNUSED,
++		    bool	       aborted UNUSED,
+                     bool               did_connect UNUSED,
+                     bool               did_timeout UNUSED,
+                     long               response_code,
+--- /libtransmission/session.c	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/session.c	2015-03-02 23:48:03.000000000 -0700
+@@ -2432,8 +2432,17 @@
+   assert (tr_isSession (session));
+ 
+   for (l = session->blocklists; l; l = l->next)
+-    if (tr_blocklistFileHasAddress (l->data, addr))
+-      return true;
++    {
++      if (tr_stringEndsWith (tr_blocklistFileGetFilename (l->data), "whitelist.bin"))
++	if (tr_blocklistFileHasAddress (l->data, addr))
++	  return false;
++    }
++  for (l = session->blocklists; l; l = l->next)
++    {
++      if (!tr_stringEndsWith (tr_blocklistFileGetFilename (l->data), "whitelist.bin"))
++	if (tr_blocklistFileHasAddress (l->data, addr))
++	  return true;
++    }
+ 
+   return false;
+ }
+--- /libtransmission/transmission.h	2015-02-14 11:26:47.000000000 -0700
++++ /libtransmission/transmission.h	2015-03-17 08:09:01.000000000 -0600
+@@ -1833,6 +1833,7 @@
+ 
+     unsigned int       trackerCount;
+     unsigned int       webseedCount;
++    int		       next_webseed_i;
+     tr_file_index_t    fileCount;
+     uint32_t           pieceSize;
+     tr_piece_index_t   pieceCount;
+--- /libtransmission/web.c	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/web.c	2015-04-04 12:39:26.000000000 -0600
+@@ -65,6 +65,7 @@
+   int torrentId;
+   long code;
+   long timeout_secs;
++  bool aborted;
+   bool did_connect;
+   bool did_timeout;
+   struct evbuffer * response;
+@@ -72,6 +73,7 @@
+   char * url;
+   char * range;
+   char * cookies;
++  char * task_addr;
+   tr_session * session;
+   tr_web_done_func done_func;
+   void * done_func_user_data;
+@@ -86,6 +88,7 @@
+     evbuffer_free (task->freebuf);
+   tr_free (task->cookies);
+   tr_free (task->range);
++  tr_free (task->task_addr);
+   tr_free (task->url);
+   tr_free (task);
+ }
+@@ -111,18 +114,70 @@
+ ****
+ ***/
+ 
++bool
++task_addr_is_blocklisted (struct tr_web_task * task)
++{
++  const char * web_addr = NULL;
++  tr_webGetTaskInfo (task, TR_WEB_GET_ADDRESS, &web_addr);
++
++  if (web_addr)
++    task->task_addr = tr_strdup (web_addr);
++  if (task->task_addr)
++    {
++      tr_address tmp;
++      if (tr_address_from_string (&tmp, task->task_addr))
++	if (tr_sessionIsAddressBlocked (task->session, &tmp))
++	  {
++	    task->aborted = true;
++	    return true;
++	  }
++    }
++    
++  return false;
++}
++    
++static int
++progress_func (void * vtask, double dltotal, double dlnow, double ultotal, double ulnow)
++{
++  struct tr_web_task * task = vtask;
++  
++  if (task->torrentId != -1)
++    {
++      tr_torrent * tor = tr_torrentFindFromId (task->session, task->torrentId);
++      if (!tor)
++	return 1;
++      else if (task_addr_is_blocklisted (task))
++	return 1;
++      else if (!tor->isRunning || tor->isStopping)
++	return 1;
++    }
++
++  return 0;
++}
++
+ static size_t
+ writeFunc (void * ptr, size_t size, size_t nmemb, void * vtask)
+ {
+   const size_t byteCount = size * nmemb;
+   struct tr_web_task * task = vtask;
+ 
+-  /* webseed downloads should be speed limited */
+   if (task->torrentId != -1)
+     {
+       tr_torrent * tor = tr_torrentFindFromId (task->session, task->torrentId);
++      tr_webGetTaskInfo (task, TR_WEB_GET_CODE, &task->code);
+ 
+-      if (tor && !tr_bandwidthClamp (&tor->bandwidth, TR_DOWN, nmemb))
++      if (!tor)
++	return byteCount + 1;
++      else if (task_addr_is_blocklisted (task))
++	return byteCount + 1;
++      /* abort if data is unusable or an empty file was sent */
++      else if (task->code != 206 && byteCount > 0 || byteCount == 0)
++	{
++	  task->aborted = true;
++	  return byteCount +1;
++	}
++      /* webseed downloads should be speed limited */
++      else if (!tr_bandwidthClamp (&tor->bandwidth, TR_DOWN, nmemb))
+         {
+           tr_list_append (&paused_easy_handles, task->curl_easy);
+           return CURL_WRITEFUNC_PAUSE;
+@@ -189,40 +244,44 @@
+   curl_easy_setopt (e, CURLOPT_SOCKOPTFUNCTION, sockoptfunction);
+   curl_easy_setopt (e, CURLOPT_SOCKOPTDATA, task);
+ #endif
++  curl_easy_setopt (e, CURLOPT_TIMEOUT, task->timeout_secs);
++  curl_easy_setopt (e, CURLOPT_URL, task->url);
++  curl_easy_setopt (e, CURLOPT_USERAGENT, TR_NAME "/" SHORT_VERSION_STRING);
++  curl_easy_setopt (e, CURLOPT_VERBOSE, (long)(web->curl_verbose?1:0));
++  
+   if (web->curl_ssl_verify)
+-    {
+-      curl_easy_setopt (e, CURLOPT_CAINFO, web->curl_ca_bundle);
+-    }
++    curl_easy_setopt (e, CURLOPT_CAINFO, web->curl_ca_bundle);
+   else
+     {
+       curl_easy_setopt (e, CURLOPT_SSL_VERIFYHOST, 0L);
+       curl_easy_setopt (e, CURLOPT_SSL_VERIFYPEER, 0L);
+     }
+-  curl_easy_setopt (e, CURLOPT_TIMEOUT, task->timeout_secs);
+-  curl_easy_setopt (e, CURLOPT_URL, task->url);
+-  curl_easy_setopt (e, CURLOPT_USERAGENT, TR_NAME "/" SHORT_VERSION_STRING);
+-  curl_easy_setopt (e, CURLOPT_VERBOSE, (long)(web->curl_verbose?1:0));
+-  curl_easy_setopt (e, CURLOPT_WRITEDATA, task);
+-  curl_easy_setopt (e, CURLOPT_WRITEFUNCTION, writeFunc);
+-
+-  if (((addr = tr_sessionGetPublicAddress (s, TR_AF_INET, &is_default_value))) && !is_default_value)
+-    curl_easy_setopt (e, CURLOPT_INTERFACE, tr_address_to_string (addr));
+-  else if (((addr = tr_sessionGetPublicAddress (s, TR_AF_INET6, &is_default_value))) && !is_default_value)
+-    curl_easy_setopt (e, CURLOPT_INTERFACE, tr_address_to_string (addr));
+-
++    
+   if (task->cookies != NULL)
+     curl_easy_setopt (e, CURLOPT_COOKIE, task->cookies);
+-
+   if (web->cookie_filename != NULL)
+     curl_easy_setopt (e, CURLOPT_COOKIEFILE, web->cookie_filename);
+-
+-  if (task->range != NULL)
++    
++  if (((addr = tr_sessionGetPublicAddress (s, TR_AF_INET, &is_default_value))) && !is_default_value)
++    curl_easy_setopt (e, CURLOPT_INTERFACE, tr_address_to_string (addr));
++  else if (((addr = tr_sessionGetPublicAddress (s, TR_AF_INET6, &is_default_value))) && !is_default_value)
++    curl_easy_setopt (e, CURLOPT_INTERFACE, tr_address_to_string (addr));
++    
++  if (task->range != NULL) 
+     {
+-      curl_easy_setopt (e, CURLOPT_RANGE, task->range);
+       /* don't bother asking the server to compress webseed fragments */
+       curl_easy_setopt (e, CURLOPT_ENCODING, "identity");
++      /* stop data transfer and disconnect webseeds when pausing torrent *
++       * or when disabling non-206-response-code webseed data transfer.	 */
++      curl_easy_setopt (e, CURLOPT_FORBID_REUSE, 1L);
++      curl_easy_setopt (e, CURLOPT_NOPROGRESS, 0L);
++      curl_easy_setopt (e, CURLOPT_PROGRESSDATA, task);
++      curl_easy_setopt (e, CURLOPT_PROGRESSFUNCTION, progress_func);
++      curl_easy_setopt (e, CURLOPT_RANGE, task->range);
++      curl_easy_setopt (e, CURLOPT_WRITEDATA, task);
++      curl_easy_setopt (e, CURLOPT_WRITEFUNCTION, writeFunc);
+     }
+-
++  
+   return e;
+ }
+ 
+@@ -238,6 +297,8 @@
+ 
+   if (task->done_func != NULL)
+     task->done_func (task->session,
++		     task->task_addr,
++		     task->aborted,
+                      task->did_connect,
+                      task->did_timeout,
+                      task->code,
+@@ -279,6 +340,8 @@
+       task = tr_new0 (struct tr_web_task, 1);
+       task->session = session;
+       task->torrentId = torrentId;
++      task->task_addr = NULL;
++      task->aborted = false;
+       task->url = tr_strdup (url);
+       task->range = tr_strdup (range);
+       task->cookies = tr_strdup (cookies);
+@@ -319,7 +382,6 @@
+                                done_func, done_func_user_data);
+ }
+ 
+-
+ struct tr_web_task *
+ tr_webRunWebseed (tr_torrent        * tor,
+                   const char        * url,
+@@ -527,7 +589,6 @@
+   session->web = NULL;
+ }
+ 
+-
+ void
+ tr_webClose (tr_session * session, tr_web_close_mode close_mode)
+ {
+--- /libtransmission/web.h	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/web.h	2015-04-04 12:39:26.000000000 -0600
+@@ -21,6 +21,7 @@
+ 
+ typedef enum
+ {
++    TR_WEB_GET_ADDRESS    = CURLINFO_PRIMARY_IP,
+     TR_WEB_GET_CODE       = CURLINFO_RESPONSE_CODE,
+     TR_WEB_GET_REDIRECTS  = CURLINFO_REDIRECT_COUNT,
+     TR_WEB_GET_REAL_URL   = CURLINFO_EFFECTIVE_URL
+@@ -36,7 +37,11 @@
+ 
+ void tr_webClose (tr_session * session, tr_web_close_mode close_mode);
+ 
++bool task_addr_is_blocklisted (struct tr_web_task * task);
++
+ typedef void (*tr_web_done_func)(tr_session       * session,
++				 char		  * task_addr,
++				 bool		    aborted,
+                                  bool               timeout_flag,
+                                  bool               did_connect_flag,
+                                  long               response_code,
+--- /libtransmission/webseed.c	2015-02-14 11:37:31.000000000 -0700
++++ /libtransmission/webseed.c	2015-04-04 23:22:37.000000000 -0600
+@@ -17,6 +17,7 @@
+ #include "cache.h"
+ #include "inout.h" /* tr_ioFindFileLocation () */
+ #include "list.h"
++#include "log.h"
+ #include "peer-mgr.h"
+ #include "torrent.h"
+ #include "trevent.h" /* tr_runInEventThread () */
+@@ -58,6 +59,12 @@
+   int                  idle_connections;
+   int                  active_transfers;
+   char              ** file_urls;
++  
++  char		     * addr;
++  bool		       addr_checked;
++  bool		       is_blocklisted;
++  struct tr_bitfield   blame;
++  int		       strike_count;
+ };
+ 
+ enum
+@@ -68,6 +75,8 @@
+ 
+   MAX_CONSECUTIVE_FAILURES = 5,
+ 
++  MAX_BAD_PIECES_PER_WEBSEED = 5,
++  
+   MAX_WEBSEED_CONNECTIONS = 4
+ };
+ 
+@@ -78,8 +87,8 @@
+ static void
+ publish (tr_webseed * w, tr_peer_event * e)
+ {
+-    if (w->callback != NULL)
+-        w->callback (&w->parent, e, w->callback_data);
++  if (w->callback != NULL)
++    w->callback (&w->parent, e, w->callback_data);
+ }
+ 
+ static void
+@@ -161,15 +170,19 @@
+       const uint32_t offset_end = data->block_offset + len;
+       tr_cache * cache = data->session->cache;
+       const tr_piece_index_t piece = data->piece_index;
+-
+-      while (len > 0)
+-        {
+-          const uint32_t bytes_this_pass = MIN (len, block_size);
+-          tr_cacheWriteBlock (cache, tor, piece, offset_end - len, bytes_this_pass, buf);
+-          len -= bytes_this_pass;
+-        }
+-
+-      fire_client_got_blocks (tor, w, data->block_index, data->count);
++      
++      if (!tr_torrentPieceIsComplete (tor, piece))
++	{
++	  while (len > 0)
++	    {
++	      const uint32_t bytes_this_pass = MIN (len, block_size);
++	      tr_cacheWriteBlock (cache, tor, piece, offset_end - len, bytes_this_pass, buf);
++	      len -= bytes_this_pass;
++	    }
++	    
++	  tr_bitfieldAdd (&w->blame, piece);
++	  fire_client_got_blocks (tor, w, data->block_index, data->count);
++	}
+     }
+ 
+   evbuffer_free (buf);
+@@ -226,14 +239,14 @@
+ {
+   const size_t n_added = info->n_added;
+   struct tr_webseed_task * task = vtask;
++  struct tr_webseed * w = task->webseed;
+   tr_session * session = task->session;
+ 
+   tr_sessionLock (session);
+ 
+-  if (!task->dead && (n_added>0))
++  if (!task->dead && (n_added>0) && !w->is_blocklisted)
+     {
+       uint32_t len;
+-      struct tr_webseed * w = task->webseed;
+ 
+       tr_bandwidthUsed (&w->bandwidth, TR_DOWN, n_added, true, tr_time_msec ());
+       fire_client_got_piece_data (w, n_added);
+@@ -299,11 +312,14 @@
+ static void
+ on_idle (tr_webseed * w)
+ {
+-  int want;
++  int want = 0;
+   int running_tasks = tr_list_size (w->tasks);
+   tr_torrent * tor = tr_torrentFindFromId (w->session, w->torrent_id);
+-
+-  if (w->consecutive_failures >= MAX_CONSECUTIVE_FAILURES)
++  
++  /* if this is a new webseed --- check our blocklist(s) first */
++  if (!w->addr)
++    want = 1;
++  else if (w->consecutive_failures >= MAX_CONSECUTIVE_FAILURES)
+     {
+       want = w->idle_connections;
+ 
+@@ -320,8 +336,9 @@
+       want = MAX_WEBSEED_CONNECTIONS - running_tasks;
+       w->retry_challenge = running_tasks + w->idle_connections + 1;
+     }
+-
+-  if (tor && tor->isRunning && !tr_torrentIsSeed (tor) && (want > 0))
++      
++  if (tor && tor->isRunning && !tor->isStopping
++	  && !tr_torrentIsSeed (tor) && (want > 0) && w->addr_checked)
+     {
+       int i;
+       int got = 0;
+@@ -333,6 +350,9 @@
+       w->idle_connections -= MIN (w->idle_connections, got);
+       if (w->retry_tickcount >= FAILURE_RETRY_INTERVAL && got == want)
+         w->retry_tickcount = 0;
++	
++      if (!w->addr)
++	w->addr_checked = false;
+ 
+       for (i=0; i<got; ++i)
+         {
+@@ -360,11 +380,47 @@
+     }
+ }
+ 
++static void
++tr_webseed_set_error (struct tr_swarm * swarm, tr_torrent * tor)
++{
++  if (tor->isRunning && !tor->isStopping && !tr_torrentIsSeed (tor))
++    {
++      if (!countActiveWebseeds (tor->swarm))
++	{
++	  const tr_info * inf = &tor->info;
++	  bool was_running = tor->isStopping;
++	  
++	  tr_torrentSetLocalError (tor, "All webseeds are either in a blocklist, or have sent unusable data. %s", 
++					(inf->next_webseed_i < inf->webseedCount)?
++					"To refresh the webseed list, re-start the torrent.":
++					"See log file, or to query them again, re-add the torrent.");
++					
++	  tor->isStopping = was_running;
++	}
++    }
++}
++
++static void
++tr_webseed_clear_error (struct tr_swarm * swarm, tr_torrent * tor)
++{
++  if (!tor->isRunning || tor->isStopping || countActiveWebseeds (tor->swarm) || tr_torrentIsSeed (tor))
++    if (tor->errorString
++	&& (!tr_strcmp0 (tor->errorString, "All webseeds are either in a blocklist, or have sent unusable data. "
++					   "To refresh the webseed list, re-start the torrent.")
++	|| !tr_strcmp0 (tor->errorString, "All webseeds are either in a blocklist, or have sent unusable data. "
++					  "See log file, or to query them again, re-add the torrent.")))
++      {
++	tor->errorString[0] = '\0';
++	tor->error = TR_STAT_OK;
++      }
++}
+ 
+ static void
+ web_response_func (tr_session    * session,
++		   char		 * task_addr,
++		   bool		   aborted,
+                    bool            did_connect UNUSED,
+-                   bool            did_timeout UNUSED,
++                   bool            did_timeout,
+                    long            response_code,
+                    const void    * response UNUSED,
+                    size_t          response_byte_count UNUSED,
+@@ -386,29 +442,69 @@
+   tor = tr_torrentFindFromId (session, w->torrent_id);
+   if (tor != NULL)
+     {
++      if (task_addr)
++	{
++	  w->addr = tr_strdup (task_addr);
++	  w->addr_checked = true;
++	}
++	
++      if (aborted && task_addr_is_blocklisted (t->web_task))
++	{
++	  w->is_blocklisted = true;
++	  tr_logAddTorInfo (tor, "Webseed IP:%s URL:%s is in one of your blocklists and has been disabled. "
++				 "To allow this webseed, add the IP to your whitelist and re-start Transmission.", 
++				  w->addr, w->base_url);
++	}
++      /* webseed was sending payload data that we cannot use -- !206 or empty file */
++      else if (aborted)
++	{
++	  w->is_blocklisted = true;
++	  tr_logAddTorInfo (tor, "Webseed IP:%s URL:%s code:%lu was sending unusable data and has been disabled. "
++				 "To query this webseed again, re-add the torrent or re-start Transmission.", 
++				  w->addr, w->base_url, response_code);
++	}
++      /* this covers loopbacks, DNS timeouts, and unresponsive webseeds */
++      else if (!w->addr || did_timeout)
++	{
++	  w->is_blocklisted = true;
++	  tr_logAddTorInfo (tor, "Webseed IP:%s URL:%s code:%lu is not returning a valid address. "
++				 "To query this webseed again, re-add the torrent or re-start Transmission.",
++				  w->addr, w->base_url, response_code);
++	}
++	    
+       /* active_transfers was only increased if the connection was successful */
+       if (t->response_code == 206)
+         --w->active_transfers;
++	
++      if (!success && !w->is_blocklisted)
++	{
++	  if (t->blocks_done)
++	    ++w->idle_connections;
++	    /* to allow for repeated button twiddling, don't increment w->consecutive_failures unless... */  
++	  else if (tor->isRunning && !tor->isStopping)
++	    {
++	      if (++w->consecutive_failures >= MAX_CONSECUTIVE_FAILURES && !w->retry_tickcount)
++		/* now wait a while until retrying to establish a connection */
++		++w->retry_tickcount;
++	    }
++	}
+ 
+-      if (!success)
++      if (!success || w->is_blocklisted)
+         {
+           const tr_block_index_t blocks_remain = (t->length + tor->blockSize - 1)
+                                                    / tor->blockSize - t->blocks_done;
+ 
+           if (blocks_remain)
+             fire_client_got_rejs (tor, w, t->block + t->blocks_done, blocks_remain);
+-
+-          if (t->blocks_done)
+-            ++w->idle_connections;
+-          else if (++w->consecutive_failures >= MAX_CONSECUTIVE_FAILURES && !w->retry_tickcount)
+-            /* now wait a while until retrying to establish a connection */
+-            ++w->retry_tickcount;
+-
++	    
+           tr_list_remove_data (&w->tasks, t);
+           evbuffer_free (t->content);
+           tr_free (t);
+-        }
+-        else
++	  
++	  if (w->is_blocklisted)
++	    tr_webseed_set_error (tor->swarm, tor);
++	}
++      else
+         {
+           const uint32_t bytes_done = t->blocks_done * tor->blockSize;
+           const uint32_t buf_len = evbuffer_get_length (t->content);
+@@ -420,32 +516,53 @@
+               t->response_code = 0;
+               task_request_next_chunk (t);
+             }
+-            else
++	  else
+             {
+-              if (buf_len)
++              if (buf_len && !tr_torrentPieceIsComplete (tor, t->piece_index))
+                 {
+                   /* on_content_changed () will not write a block if it is smaller than
+                      the torrent's block size, i.e. the torrent's very last block */
+                   tr_cacheWriteBlock (session->cache, tor,
+                                       t->piece_index, t->piece_offset + bytes_done,
+                                       buf_len, t->content);
+-
++		  tr_bitfieldAdd (&w->blame, t->piece_index);
+                   fire_client_got_blocks (tor, t->webseed,
+                                           t->block + t->blocks_done, 1);
+                 }
+ 
+-              ++w->idle_connections;
+-
+               tr_list_remove_data (&w->tasks, t);
+               evbuffer_free (t->content);
+               tr_free (t);
+-
+-              on_idle (w);
++	      
++	      ++w->idle_connections;	      
++	      
++	      on_idle (w);
+             }
+         }
+     }
+ }
+ 
++void
++tr_webseed_add_strike (tr_webseed	  * w,
++				tr_torrent	  * tor,
++				tr_piece_index_t    pieceIndex)
++{
++  if (tr_bitfieldHas (&w->blame, pieceIndex))
++    {
++      ++w->strike_count;
++      
++      if (w->strike_count < MAX_BAD_PIECES_PER_WEBSEED)
++	tr_logAddTorDbg (tor, "Webseed IP:%s URL:%s contributed to corrupt piece %d, strike_count is %d.", 
++				w->addr, w->base_url, pieceIndex, w->strike_count);
++      else
++	{
++	  w->is_blocklisted = true;
++	  tr_logAddTorInfo (tor, "Webseed IP:%s URL:%s has sent %d bad pieces and has been disabled.", 
++				  w->addr, w->base_url, MAX_BAD_PIECES_PER_WEBSEED);
++	}
++    }
++}
++
+ static struct evbuffer *
+ make_url (tr_webseed * w, const tr_file * file)
+ {
+@@ -509,11 +626,18 @@
+ webseed_timer_func (evutil_socket_t foo UNUSED, short bar UNUSED, void * vw)
+ {
+   tr_webseed * w = vw;
+-
+-  if (w->retry_tickcount)
+-    ++w->retry_tickcount;
+-
+-  on_idle (w);
++  tr_torrent * tor = tr_torrentFindFromId (w->session, w->torrent_id);
++  
++  if (tor != NULL)
++    tr_webseed_clear_error (tor->swarm, tor);
++    
++  if (!w->is_blocklisted)
++    {
++      if (w->retry_tickcount)
++	++w->retry_tickcount;
++      
++      on_idle (w);
++    }
+ 
+   tr_timerAddMsec (w->timer, TR_IDLE_TIMER_MSEC);
+ }
+@@ -573,6 +697,8 @@
+   /* webseed destruct */
+   event_free (w->timer);
+   tr_bandwidthDestruct (&w->bandwidth);
++  tr_bitfieldDestruct (&w->blame);
++  tr_free (w->addr);
+   tr_free (w->base_url);
+ 
+   /* parent class destruct */
+@@ -585,6 +711,12 @@
+   .is_transferring_pieces = webseed_is_transferring_pieces
+ };
+ 
++bool
++tr_webseed_is_blocklisted (tr_webseed * w)
++{
++  return w->is_blocklisted;
++}
++
+ /***
+ ****
+ ***/
+@@ -613,9 +745,14 @@
+   w->callback = callback;
+   w->callback_data = callback_data;
+   w->file_urls = tr_new0 (char *, inf->fileCount);
+-  //tr_rcConstruct (&w->download_rate);
++  w->addr = NULL;
++  w->addr_checked = !w->addr;
++  w->is_blocklisted = false;
++  w->strike_count = 0;
+   tr_bandwidthConstruct (&w->bandwidth, tor->session, &tor->bandwidth);
++  tr_bitfieldConstruct (&w->blame, tor->blockCount);
+   w->timer = evtimer_new (w->session->event_base, webseed_timer_func, w);
+   tr_timerAddMsec (w->timer, TR_IDLE_TIMER_MSEC);
++  
+   return w;
+ }
+--- /libtransmission/webseed.h	2015-02-14 11:26:46.000000000 -0700
++++ /libtransmission/webseed.h	2015-03-24 14:33:38.000000000 -0600
+@@ -18,9 +18,15 @@
+ 
+ #include "peer-common.h"
+ 
+-tr_webseed* tr_webseedNew (struct tr_torrent * torrent,
+-                           const char        * url,
+-                           tr_peer_callback    callback,
+-                           void              * callback_data);
++tr_webseed * tr_webseedNew (struct tr_torrent	* torrent,
++                            const char		* url,
++                            tr_peer_callback	  callback,
++                            void		* callback_data);
++			   
++bool tr_webseed_is_blocklisted (tr_webseed	* webseed);
+ 
++void tr_webseed_add_strike (tr_webseed		* webseed,
++			    struct tr_torrent	* torrent,
++			    tr_piece_index_t	  pieceIndex);
++				     
+ #endif
