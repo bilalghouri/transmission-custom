@@ -10,7 +10,7 @@
 ### END INIT INFO
 
 NAME=transmission-daemon
-DAEMON=/usr/bin/$NAME
+DAEMON=/usr/local/bin/$NAME
 USER=root
 STOP_TIMEOUT=30
 
